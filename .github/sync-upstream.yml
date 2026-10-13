@@ -1,0 +1,22 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 每天 11:00（北京时间）
+  workflow_dispatch:     # 也允许手动点一下触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fast-forward main to upstream
+        run: |
+          git remote add upstream https://github.com/morluto/rea.git
+          git fetch upstream --quiet
+          git merge --ff-only upstream/main
+          git push origin main
