@@ -4,11 +4,9 @@ import { dirname, join, resolve } from "node:path";
 import { err, ok, type Result } from "../domain/result.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import {
-  readRegularFile,
-  RegularFileCleanupFailure,
-  retryRegularFileCleanup,
-} from "./RegularFileRead.js";
+import { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
+import { readRegularFile, retryRegularFileCleanup } from "./RegularFileRead.js";
+import { referenceSourceResourceFailure } from "../reference/ReferenceSourceReaderErrors.js";
 import type { ReferenceSourceReaderError } from "../reference/ReferenceSourceReaderTypes.js";
 
 export type ReferenceSourceVcsInfo =
@@ -59,13 +57,7 @@ export const readReferenceSourceVcs = async (
     });
   } catch (cause: unknown) {
     if (!(cause instanceof ArtifactReaderFailure)) throw cause;
-    return err({
-      tag: "reference-source-reader",
-      code: cause.reason === "cancelled" ? "cancelled" : "io",
-      message: cause.message,
-      ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
-      cause,
-    });
+    return err(referenceSourceResourceFailure(cause));
   }
 };
 
@@ -88,8 +80,9 @@ const resolveSourceHead = async (
     try {
       return await readRegularFile(path, { signal });
     } catch (cause: unknown) {
+      if (signal?.aborted === true && cause === signal.reason) throw cause;
       if (!(cause instanceof RegularFileCleanupFailure)) throw cause;
-      const retry = await retryRegularFileCleanup(cause, resources);
+      const retry = await retryRegularFileCleanup(cause, resources, signal);
       if (
         retry.outcome.kind === "failed" &&
         errorCode(retry.outcome.cause) !== "ENOENT"
@@ -162,14 +155,21 @@ const resolveSourceHead = async (
         // The library probes readFile() without a path to detect promise APIs.
         // Reject that invocation without attributing it to a source read.
         if (path === undefined)
-          throw new TypeError("Git filesystem read requires a path");
+          throw new TypeError("Git metadata path is required");
         try {
           const bytes = await readMetadataBytes(path);
           const encoding =
-            typeof options === "string" ? options : options?.encoding;
-          return encoding === undefined || encoding === null
-            ? bytes
-            : bytes.toString(encoding);
+            typeof options === "string"
+              ? options
+              : typeof options === "object" &&
+                  options !== null &&
+                  "encoding" in options
+                ? options.encoding
+                : undefined;
+          if (encoding === undefined || encoding === null) return bytes;
+          if (typeof encoding !== "string" || !Buffer.isEncoding(encoding))
+            throw new TypeError("Unsupported Git metadata text encoding");
+          return bytes.toString(encoding);
         } catch (cause: unknown) {
           if (cause instanceof ArtifactReaderFailure) {
             cleanupFailures.push(cause);

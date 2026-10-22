@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { AnalysisInputError } from "./analysisErrorCore.js";
+import { EvidenceIntegrityError } from "./evidenceErrors.js";
 import {
   createEvidence,
   parseEvidence,
@@ -18,6 +20,7 @@ import {
 import { createResidualUnknown } from "./residualUnknown.js";
 
 import { compareFunctions } from "./functionComparison.js";
+import { functionSnapshotFixture } from "./functionDossierEvidence.fixture.js";
 import { verifyReconstruction } from "./reconstructionVerification.js";
 const dossier = jsonValueSchema.parse(
   functionDossierSchema.parse({
@@ -44,6 +47,16 @@ const dossier = jsonValueSchema.parse(
     referenced_names: [],
     native_api: null,
     native_value_flow: null,
+    facet_availability: {
+      pseudocode: { available: true },
+      assembly: { available: true },
+      comments: { available: true },
+      callers: { available: true },
+      callees: { available: true },
+      references: { available: true },
+      strings_names: { available: true },
+      cfg: { available: true },
+    },
     basic_blocks: [{ start: "0x1000", end: "0x1001", successors: [] }],
     limitations: [],
   }),
@@ -53,6 +66,7 @@ const source = (
   digit: string,
   observation: Partial<EvidenceObservation> = {},
   hasSubject = true,
+  hasCoverage = true,
 ): Evidence =>
   createEvidence(
     hasSubject
@@ -69,7 +83,9 @@ const source = (
       result: dossier,
       confidence: "derived",
       authority: "shipped-artifact",
-      relationshipCoverage: { status: "complete" },
+      ...(hasCoverage
+        ? { relationshipCoverage: { status: "complete" as const } }
+        : {}),
       ...observation,
     },
   );
@@ -90,7 +106,10 @@ const provider = {
   name: "REA function comparison",
   version: "1",
 };
-const baselineResult = compareFunctions(left, right);
+const baselineResult = compareFunctions(
+  functionSnapshotFixture(left),
+  functionSnapshotFixture(right),
+);
 
 const comparison = (
   parameters: Record<string, JsonValue>,
@@ -197,12 +216,179 @@ describe("function reconstruction source parameters", () => {
   });
 });
 
+describe("historical calls-only reconstruction changes", () => {
+  it.each(["missing", "unknown", "partial", "unresolved"] as const)(
+    "keeps historical calls-only changes unknown with %s call coverage",
+    (coverage) => {
+      const changedDossier = functionDossierSchema.parse({
+        ...functionDossierSchema.parse(dossier),
+        callees: [
+          {
+            address: "0x2000",
+            name: "puts",
+            classification: null,
+            body: { available: false, reason: "External function." },
+          },
+        ],
+      });
+      const complete = source("8", {
+        result: jsonValueSchema.parse(changedDossier),
+      });
+      const incomplete = source(
+        "9",
+        {
+          result: jsonValueSchema.parse({
+            ...changedDossier,
+            ...(coverage === "unresolved"
+              ? {
+                  unresolved_calls: [
+                    {
+                      address: "0x1004",
+                      reason: "Computed target unresolved.",
+                    },
+                  ],
+                }
+              : {}),
+          }),
+          ...(coverage === "missing"
+            ? {}
+            : {
+                relationshipCoverage:
+                  coverage === "unknown"
+                    ? { status: "unknown", reason: "Call graph unavailable." }
+                    : coverage === "partial"
+                      ? {
+                          status: "partial",
+                          limitations: ["Additional edges omitted."],
+                        }
+                      : { status: "complete" },
+              }),
+        },
+        true,
+        coverage !== "missing",
+      );
+      const historicalResult = compareFunctions(
+        functionSnapshotFixture(left),
+        functionSnapshotFixture(complete),
+      );
+      expect(historicalResult).toMatchObject({
+        status: "changed",
+        summary: { changed: 1 },
+      });
+      expect(historicalResult.changes).toMatchObject([
+        { dimension: "calls", status: "changed" },
+      ]);
+      const completeComparison = comparison(
+        {
+          left_evidence_id: left.evidence_id,
+          right_evidence_id: complete.evidence_id,
+        },
+        {},
+        [left, complete],
+        {},
+        historicalResult,
+      );
+      expect(
+        admittedVerification(completeComparison, [left, complete], "overall")()
+          .status,
+      ).toBe("fail");
+      const evidence = comparison(
+        {
+          left_evidence_id: left.evidence_id,
+          right_evidence_id: incomplete.evidence_id,
+        },
+        {},
+        [left, incomplete],
+        {},
+        historicalResult,
+      );
+      const before = JSON.stringify(evidence);
+      for (const dimension of ["calls", "overall"] as const) {
+        expect(
+          admittedVerification(evidence, [left, incomplete], dimension)(),
+        ).toMatchObject({
+          status: "unknown",
+          summary: { total: 1, passed: 0, failed: 0, unknown: 1 },
+          claims: {
+            items: [
+              expect.objectContaining({
+                status: "unknown",
+                observed_status: "changed",
+                limitations: expect.arrayContaining([
+                  expect.stringContaining(`Source ${incomplete.evidence_id}:`),
+                ]),
+              }),
+            ],
+          },
+        });
+      }
+      expect(
+        admittedVerification(evidence, [left, incomplete], "pseudocode")()
+          .status,
+      ).toBe("pass");
+      expect(JSON.stringify(evidence)).toBe(before);
+    },
+  );
+});
+
 describe("function reconstruction call coverage", () => {
+  it("preserves complete call diagnostics while passing equal call claims", () => {
+    const diagnostic = "Indirect calls remain unresolved.";
+    const leftWithDiagnostic = source("a", {
+      relationshipCoverage: { status: "complete", diagnostics: [diagnostic] },
+    });
+    const rightWithDiagnostic = source("b", {
+      relationshipCoverage: { status: "complete", diagnostics: [diagnostic] },
+    });
+    const observed = compareFunctions(
+      functionSnapshotFixture(leftWithDiagnostic),
+      functionSnapshotFixture(rightWithDiagnostic),
+    );
+    expect(
+      observed.dimensions.find(({ dimension }) => dimension === "calls"),
+    ).toMatchObject({
+      status: "unchanged",
+      limitations: [`Left: ${diagnostic}`, `Right: ${diagnostic}`],
+    });
+    const evidence = comparison(
+      {
+        left_evidence_id: leftWithDiagnostic.evidence_id,
+        right_evidence_id: rightWithDiagnostic.evidence_id,
+      },
+      {},
+      [leftWithDiagnostic, rightWithDiagnostic],
+      {},
+      observed,
+    );
+    expect(
+      admittedVerification(
+        evidence,
+        [leftWithDiagnostic, rightWithDiagnostic],
+        "calls",
+      )(),
+    ).toMatchObject({
+      status: "pass",
+      claims: {
+        items: [
+          expect.objectContaining({
+            status: "pass",
+            observed_status: "unchanged",
+            limitations: expect.arrayContaining([
+              `Source ${leftWithDiagnostic.evidence_id}: ${diagnostic}`,
+              `Source ${rightWithDiagnostic.evidence_id}: ${diagnostic}`,
+            ]),
+          }),
+        ],
+      },
+    });
+  });
+
   it("rechecks old unchanged comparisons without affecting unrelated finite dimensions", () => {
     const incomplete = source("7", {
       relationshipCoverage: {
         status: "unknown",
         reason: "Call graph unavailable.",
+        diagnostics: ["Indirect calls remain unresolved."],
       },
     });
     const incompleteSides = {
@@ -227,6 +413,7 @@ describe("function reconstruction call coverage", () => {
               observed_status: "unchanged",
               limitations: expect.arrayContaining([
                 `Source ${incomplete.evidence_id}: Call graph unavailable.`,
+                `Source ${incomplete.evidence_id}: Indirect calls remain unresolved.`,
               ]),
             }),
           ],
@@ -262,7 +449,10 @@ describe("function reconstruction call coverage", () => {
         reason: "Call graph unavailable.",
       },
     });
-    const changedResult = compareFunctions(left, changedComplete);
+    const changedResult = compareFunctions(
+      functionSnapshotFixture(left),
+      functionSnapshotFixture(changedComplete),
+    );
     const oldChanged = comparison(
       {
         left_evidence_id: left.evidence_id,
@@ -363,7 +553,9 @@ describe("function reconstruction source aliases", () => {
   ] satisfies [string, Record<string, JsonValue>][])(
     "rejects %s after valid digest admission",
     (_name, parameters) => {
-      expect(admittedVerification(comparison(parameters))).toThrow();
+      expect(admittedVerification(comparison(parameters))).toThrow(
+        EvidenceIntegrityError,
+      );
     },
   );
 });
@@ -391,7 +583,7 @@ describe("function reconstruction malformed source IDs", () => {
             admittedVerification(
               comparison({ ...singular, ...aliases, [field]: invalid }),
             ),
-          ).toThrow();
+          ).toThrow(EvidenceIntegrityError);
         }
       }
     },
@@ -420,7 +612,7 @@ describe("function reconstruction malformed source IDs", () => {
             admittedVerification(
               comparison({ ...plural, ...aliases, [field]: invalid }),
             ),
-          ).toThrow();
+          ).toThrow(EvidenceIntegrityError);
         }
       }
     },
@@ -437,7 +629,7 @@ describe("function reconstruction malformed source IDs", () => {
     ],
   ])("rejects %s", (_name, parameters) => {
     expect(admittedVerification(comparison(parameters))).toThrow(
-      /repeats a source within one side/u,
+      EvidenceIntegrityError,
     );
   });
 });
@@ -450,7 +642,7 @@ describe("function reconstruction admission controls", () => {
         admittedVerification(
           comparison(parameters, { evidenceLinks: [left.evidence_id] }),
         ),
-      ).toThrow(/closure disagrees/u);
+      ).toThrow(EvidenceIntegrityError);
       expect(
         admittedVerification(
           comparison(parameters, {
@@ -462,10 +654,23 @@ describe("function reconstruction admission controls", () => {
           }),
           [left, right, extra],
         ),
-      ).toThrow(/closure disagrees/u);
-      expect(admittedVerification(comparison(parameters), [left])).toThrow(
-        /Missing source Evidence/u,
-      );
+      ).toThrow(EvidenceIntegrityError);
+      try {
+        admittedVerification(comparison(parameters), [left])();
+        throw new Error("Expected a missing source to be rejected");
+      } catch (error: unknown) {
+        expect(error).toBeInstanceOf(AnalysisInputError);
+        expect(error).toMatchObject({
+          userMessage: expect.stringMatching(/Missing source Evidence/u),
+          issues: [
+            {
+              path: ["claims", 0, "comparison_evidence_id"],
+              reason: "invalid_value",
+              message: expect.stringMatching(/Missing source Evidence/u),
+            },
+          ],
+        });
+      }
     },
   );
 
@@ -480,7 +685,7 @@ describe("function reconstruction admission controls", () => {
       [wrong, right],
     );
     expect(admittedVerification(evidence, [wrong, right])).toThrow(
-      /unexpected observation type/u,
+      EvidenceIntegrityError,
     );
   });
 
@@ -495,7 +700,9 @@ describe("function reconstruction admission controls", () => {
         {},
         [wrong, right],
       );
-      expect(admittedVerification(evidence, [wrong, right])).toThrow();
+      expect(admittedVerification(evidence, [wrong, right])).toThrow(
+        EvidenceIntegrityError,
+      );
     },
   );
 
@@ -537,7 +744,7 @@ describe("function reconstruction admission controls", () => {
     ]);
   });
 
-  it("rejects selected-dimension citations outside comparison closure", () => {
+  it("rejects any comparison finding link outside the top-level closure", () => {
     const evidence = comparison(singular, {
       result: jsonValueSchema.parse({
         ...baselineResult,
@@ -552,7 +759,7 @@ describe("function reconstruction admission controls", () => {
       }),
     });
     expect(admittedVerification(evidence, [left, right, extra])).toThrow(
-      /dimension cites Evidence outside comparison closure/u,
+      EvidenceIntegrityError,
     );
   });
 });
@@ -565,7 +772,7 @@ describe("function reconstruction evidence integrity", () => {
     { authority: "shipped-artifact" as const },
   ])("rejects changed comparison identity or authority %j", (observation) => {
     expect(admittedVerification(comparison(singular, observation))).toThrow(
-      /identity or authority disagrees/u,
+      "operation" in observation ? AnalysisInputError : EvidenceIntegrityError,
     );
   });
 
@@ -578,7 +785,7 @@ describe("function reconstruction evidence integrity", () => {
       admittedVerification(
         comparison(singular, {}, [left, right], { provider: identity }),
       ),
-    ).toThrow(/identity or authority disagrees/u);
+    ).toThrow(EvidenceIntegrityError);
   });
 
   it("rejects an artifact-bound comparison", () => {
@@ -589,9 +796,7 @@ describe("function reconstruction evidence integrity", () => {
         format: "file",
       },
     });
-    expect(admittedVerification(evidence)).toThrow(
-      /identity or authority disagrees/u,
-    );
+    expect(admittedVerification(evidence)).toThrow(EvidenceIntegrityError);
   });
 
   it("retains active source unknowns as a gating result", () => {
@@ -642,6 +847,6 @@ describe("function reconstruction evidence integrity", () => {
         specification(evidence),
         createEvidenceBundle([left, right, tampered]),
       ),
-    ).toThrow(/semantic identifier does not match/u);
+    ).toThrow(EvidenceIntegrityError);
   });
 });

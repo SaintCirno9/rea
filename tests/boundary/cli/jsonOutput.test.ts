@@ -161,6 +161,48 @@ describe("incremental CLI JSON", () => {
   );
 });
 
+describe("CLI command output wrapping", () => {
+  it("wraps a mounted group root reached through its alias", async () => {
+    const chunks: Buffer[] = [];
+    const destination = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        chunks.push(chunk);
+        callback();
+      },
+    });
+    const output = createCliResultOutput(
+      ["--format", "json", "--full-output"],
+      destination,
+    );
+    if (output === undefined)
+      throw new Error("Missing structured output surface");
+
+    const group = Cli.create("nested", {
+      aliases: ["nested-alias"],
+      run: () => ({ kind: "group-root" }),
+    }).command("child", { run: () => ({ kind: "child" }) });
+    const cli = Cli.create("rea-output-group-test", { sync: false }).command(
+      group,
+    );
+    streamCliCommandResults(cli, output);
+
+    let fallback = "";
+    await cli.serve(["nested-alias", "--format", "json"], {
+      stdout: (text) => {
+        if (!output.handled) fallback += text;
+      },
+    });
+
+    expect(output.handled).toBe(true);
+    expect(fallback).toBe("");
+    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toMatchObject({
+      ok: true,
+      data: { kind: "group-root" },
+      meta: { command: "nested" },
+    });
+  });
+});
+
 describe("CLI result output surface", () => {
   it.each(["json", "yaml", "toon", "md"] as const)(
     "places typed analysis failures in the full-output error envelope (%s)",
@@ -491,7 +533,7 @@ describe("CLI result output surface", () => {
       },
     });
     const cli = Cli.create("rea-output-test", { sync: false });
-    registerManagedCommands(cli, silentLogger, async (path, operation) => {
+    registerManagedCommands(cli, silentLogger, async (...[path, operation]) => {
       expect(path).toBe("fixture.dll");
       expect(operation).toBe("inspect_managed_members");
       return value;
@@ -560,4 +602,36 @@ describe("CLI result output surface", () => {
       meta: { command: "inspect-managed-members" },
     });
   }, 60_000);
+});
+
+describe("streamed CLI filtered selections", () => {
+  it.each([
+    ["raw_result", "json", "null\n"],
+    ["raw_result", "jsonl", "null\n"],
+    ["nested.value", "json", '{"nested":{"value":null}}\n'],
+    ["missing", "json", "{}\n"],
+    ["count", "json", "0\n"],
+    ["enabled", "json", "false\n"],
+  ] as const)(
+    "keeps the selected value of --filter-output %s in %s",
+    async (filter, format, expected) => {
+      const chunks: Buffer[] = [];
+      const destination = new Writable({
+        write(chunk: Buffer, _encoding, callback) {
+          chunks.push(chunk);
+          callback();
+        },
+      });
+      const output = createCliResultOutput(
+        ["--format", format, "--filter-output", filter],
+        destination,
+      );
+      if (output === undefined) throw new Error("Missing JSON output surface");
+      await output.write(
+        { raw_result: null, nested: { value: null }, count: 0, enabled: false },
+        { command: "fixture", duration: "1ms", format },
+      );
+      expect(Buffer.concat(chunks).toString("utf8")).toBe(expected);
+    },
+  );
 });
